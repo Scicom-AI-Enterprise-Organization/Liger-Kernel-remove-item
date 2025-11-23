@@ -72,7 +72,7 @@ def fused_linear_cross_entropy_forward(
 
     # TODO: evaluate how CUDA synchronization caused by .item() affects the speed
     target_mask = target != ignore_index
-    total_n_non_ignore = target_mask.sum().item()
+    total_n_non_ignore = target_mask.sum()
     total_sum_non_ignore_ce_weight = total_n_non_ignore
     ce_weight_sum = 0.0
     if ce_weight is not None:
@@ -81,9 +81,9 @@ def fused_linear_cross_entropy_forward(
             f"If given, weight has to be a Tensor of floating point dtype. Got: {ce_weight.dtype}"
         )
         total_sum_non_ignore_ce_weight = (
-            torch.gather(ce_weight, dim=0, index=target.masked_select(target_mask)).sum().item()
+            torch.gather(ce_weight, dim=0, index=target.masked_select(target_mask)).sum()
         )
-        ce_weight_sum = ce_weight.sum().item()
+        ce_weight_sum = ce_weight.sum()
         if ce_weight.stride(-1) != 1:
             ce_weight = ce_weight.contiguous()
 
