@@ -12,7 +12,64 @@ from liger_kernel.ops.utils import is_hip
 # The optimal maximum block size depends on your hardware, your kernel, and your dtype
 MAX_FUSED_SIZE = 65536 // 2
 
-
+@torch._dynamo.disable()
+def _call_liger_ce_kernel(
+    logits_chunk,
+    target_chunk,
+    ce_weight,
+    loss_1d_slice,
+    z_loss_1d_slice,
+    token_accuracy_1d_slice,
+    total_n_non_ignore,
+    total_sum_non_ignore_ce_weight,
+    ce_weight_sum,
+    ignore_index,
+    lse_square_scale,
+    label_smoothing,
+    reduction,
+    softcap,
+    return_z_loss,
+    return_token_accuracy,
+    input_requires_grad,
+    BLOCK_SIZE,
+):
+    """
+    Small wrapper that calls the Triton kernel. This function is intentionally
+    excluded from torch.compile so Triton launch sites don't force retracing.
+    """
+    n_rows = logits_chunk.shape[0]
+    # call the triton kernel in the same way as original code
+    liger_cross_entropy_kernel[(n_rows,)](
+        X_ptr=logits_chunk,
+        X_stride=logits_chunk.stride(-2),
+        Y_ptr=target_chunk,
+        Y_stride=target_chunk.stride(-1),  # always 1
+        weight_ptr=ce_weight,
+        loss_ptr=loss_1d_slice,
+        z_loss_ptr=z_loss_1d_slice,
+        loss_stride=loss_1d_slice.stride(-1),  # always 1
+        token_accuracy_ptr=token_accuracy_1d_slice,
+        token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
+        if return_token_accuracy
+        else 0,  # always 1 if accuracy is enabled
+        n_cols=logits_chunk.shape[-1],
+        n_non_ignore=total_n_non_ignore,
+        sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
+        weight_sum=ce_weight_sum,
+        ignore_index=ignore_index,
+        lse_square_scale=lse_square_scale,
+        label_smoothing=label_smoothing,
+        reduction=reduction,
+        softcap=softcap,
+        RETURN_Z_LOSS=return_z_loss,
+        RETURN_TOKEN_ACCURACY=return_token_accuracy,
+        HAS_WEIGHT=True if ce_weight is not None else False,
+        HAS_SOFTCAPPING=True if softcap is not None else False,
+        HAS_GRADIENTS=input_requires_grad,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=32 if not is_hip() else 16,
+    )
+    
 def fused_linear_cross_entropy_forward(
     _input,
     weight,
@@ -87,10 +144,9 @@ def fused_linear_cross_entropy_forward(
         if ce_weight.stride(-1) != 1:
             ce_weight = ce_weight.contiguous()
 
-    for chunk_id in range(num_chunks):
-        start_idx = chunk_id * chunk_size
-        end_idx = min((chunk_id + 1) * chunk_size, BT)
-        _input_chunk = _input[start_idx:end_idx]  # chunk_size x H
+    for start_idx in range(0, BT, chunk_size):
+        end_idx = min(start_idx + chunk_size, BT)
+        _input_chunk = _input[start_idx:end_idx]
 
         # when doing matmul, use the original precision
         logits_chunk = _input_chunk @ weight.t()  # chunk_size x V
@@ -141,35 +197,25 @@ def fused_linear_cross_entropy_forward(
         target_chunk = target_chunk.contiguous()
 
         # Here we calculate the gradient of logits_chunk in place so we can save memory.
-        liger_cross_entropy_kernel[(n_rows,)](
-            X_ptr=logits_chunk,
-            X_stride=logits_chunk.stride(-2),
-            Y_ptr=target_chunk,
-            Y_stride=target_chunk.stride(-1),  # always 1
-            weight_ptr=ce_weight,
-            loss_ptr=loss_1d_slice,
-            z_loss_ptr=z_loss_1d_slice,
-            loss_stride=loss_1d_slice.stride(-1),  # always 1
-            token_accuracy_ptr=token_accuracy_1d_slice,
-            token_accuracy_stride=token_accuracy_1d_slice.stride(-1)
-            if return_token_accuracy
-            else 0,  # always 1 if accuracy is enabled
-            n_cols=V,
-            n_non_ignore=total_n_non_ignore,
-            sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
-            weight_sum=ce_weight_sum,
-            ignore_index=ignore_index,
-            lse_square_scale=lse_square_scale,
-            label_smoothing=label_smoothing,
-            reduction=reduction,
-            softcap=softcap,
-            RETURN_Z_LOSS=return_z_loss,
-            RETURN_TOKEN_ACCURACY=return_token_accuracy,
-            HAS_WEIGHT=True if ce_weight is not None else False,
-            HAS_SOFTCAPPING=True if softcap is not None else False,
-            HAS_GRADIENTS=input_requires_grad,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_warps=32 if not is_hip() else 16,
+        _call_liger_ce_kernel(
+            logits_chunk,
+            target_chunk,
+            ce_weight,
+            loss_1d_slice,
+            z_loss_1d_slice,
+            token_accuracy_1d_slice,
+            total_n_non_ignore,
+            total_sum_non_ignore_ce_weight,
+            ce_weight_sum,
+            ignore_index,
+            lse_square_scale,
+            label_smoothing,
+            reduction,
+            softcap,
+            return_z_loss,
+            return_token_accuracy,
+            input_requires_grad,
+            BLOCK_SIZE,
         )
 
         # Apply token scaling if requested
